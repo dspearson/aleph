@@ -1,29 +1,30 @@
 (ns aleph.http
   (:refer-clojure :exclude [get])
   (:require
-    [clojure.string :as str]
-    [manifold.deferred :as d]
-    [manifold.executor :as executor]
-    [manifold.stream :as s]
-    [aleph.flow :as flow]
-    [aleph.http
-     [server :as server]
-     [client :as client]
-     [client-middleware :as middleware]
-     [core :as http-core]]
-    [aleph.netty :as netty])
+   [clojure.string :as str]
+   [manifold.deferred :as d]
+   [manifold.executor :as executor]
+   [manifold.stream :as s]
+   [aleph.flow :as flow]
+   [aleph.http
+    [server :as server]
+    [client :as client]
+    [client-middleware :as middleware]
+    [core :as http-core]]
+   [aleph.netty :as netty]
+   [clojure.java.io :as io])
   (:import
-    [io.aleph.dirigiste Pools]
-    [aleph.utils
-     PoolTimeoutException
-     ConnectionTimeoutException
-     RequestTimeoutException
-     ReadTimeoutException]
-    [java.net
-     URI
-     InetSocketAddress]
-    [java.util.concurrent
-     TimeoutException]))
+   [io.aleph.dirigiste Pools]
+   [aleph.utils
+    PoolTimeoutException
+    ConnectionTimeoutException
+    RequestTimeoutException
+    ReadTimeoutException]
+   [java.net
+    URI
+    InetSocketAddress]
+   [java.util.concurrent
+    TimeoutException]))
 
 (defn start-server
   "Starts an HTTP server using the provided Ring `handler`.  Returns a server object which can be stopped
@@ -48,7 +49,9 @@
    | `epoll?` | if `true`, uses `epoll` when available, defaults to `false`
    | `compression?` | when `true` enables http compression, defaults to `false`
    | `compression-level` | optional compression level, `1` yields the fastest compression and `9` yields the best compression, defaults to `6`. When set, enables http content compression regardless of the `compression?` flag value
-   | `idle-timeout` | when set, forces keep-alive connections to be closed after an idle time, in milliseconds"
+   | `idle-timeout` | when set, forces keep-alive connections to be closed after an idle time, in milliseconds
+   | `continue-handler` | optional handler which is invoked when header sends \"Except: 100-continue\" header to test whether the request should be accepted or rejected. Handler should return `true`, `false`, ring responseo to be used as a reject response or deferred that yields one of those.
+   | `continue-executor` | optional `java.util.concurrent.Executor` which is used to handle requests passed to :continue-handler.  To avoid this indirection you may specify `:none`, but in this case extreme care must be taken to avoid blocking operations on the handler's thread."
   [handler options]
   (server/start-server handler options))
 
@@ -154,31 +157,40 @@
      (IllegalArgumentException.
       ":idle-timeout option is not allowed when :keep-alive? is explicitly disabled")))
 
-  (let [conn-options' (cond-> connection-options
-                        (some? dns-options)
-                        (assoc :name-resolver (netty/dns-resolver-group dns-options)))
+  (let [log-activity (:log-activity connection-options)
+        dns-options' (if-not (and (some? dns-options)
+                                  (not (contains? dns-options :epoll?)))
+                       dns-options
+                       (let [epoll? (:epoll? connection-options false)]
+                         (assoc dns-options :epoll? epoll?)))
+        conn-options' (cond-> connection-options
+                        (some? dns-options')
+                        (assoc :name-resolver (netty/dns-resolver-group dns-options'))
+
+                        (some? log-activity)
+                        (assoc :log-activity (netty/activity-logger "aleph-client" log-activity)))
         p (promise)
         pool (flow/instrumented-pool
-               {:generate (fn [host]
-                            (let [c (promise)
-                                  conn (create-connection
-                                         host
-                                         conn-options'
-                                         middleware
-                                         #(flow/dispose @p host [@c]))]
-                              (deliver c conn)
-                              [conn]))
-                :destroy (fn [_ c]
-                           (d/chain' c
-                             first
-                             client/close-connection))
-                :control-period control-period
-                :max-queue-size max-queue-size
-                :controller (Pools/utilizationController
-                              target-utilization
-                              connections-per-host
-                              total-connections)
-                :stats-callback stats-callback})]
+              {:generate (fn [host]
+                           (let [c (promise)
+                                 conn (create-connection
+                                       host
+                                       conn-options'
+                                       middleware
+                                       #(flow/dispose @p host [@c]))]
+                             (deliver c conn)
+                             [conn]))
+               :destroy (fn [_ c]
+                          (d/chain' c
+                                    first
+                                    client/close-connection))
+               :control-period control-period
+               :max-queue-size max-queue-size
+               :controller (Pools/utilizationController
+                            target-utilization
+                            connections-per-host
+                            total-connections)
+               :stats-callback stats-callback})]
     @(deliver p pool)))
 
 (def default-connection-pool
@@ -254,6 +266,23 @@
    (http-core/websocket-ping conn d' nil))
   ([conn d' data]
    (http-core/websocket-ping conn d' data)))
+
+(defn websocket-close!
+  "Closes given websocket endpoint (either client or server) sending Close frame with provided
+   status code and reason text. Returns a deferred that will yield `true` whenever the closing
+   handshake was initiated with given params or `false` if the connection was already closed.
+   Note, that for the server closes the connection right after Close frame was flushed but the
+   client waits for the connection to be closed by the server (no longer than close handshake
+   timeout, see websocket connection configuration for more details)."
+  ([conn]
+   (websocket-close! conn http-core/close-empty-status-code "" nil))
+  ([conn status-code]
+   (websocket-close! conn status-code "" nil))
+  ([conn status-code reason-text]
+   (websocket-close! conn status-code reason-text nil))
+  ([conn status-code reason-text deferred]
+   (let [d' (or deferred (d/deferred))]
+     (http-core/websocket-close! conn status-code reason-text d'))))
 
 (let [maybe-timeout! (fn [d timeout] (when d (d/timeout! d timeout)))]
   (defn request
@@ -428,3 +457,14 @@
     (let [response (d/deferred)]
       (handler request #(d/success! response %) #(d/error! response %))
       response)))
+
+(defn file
+  "Specifies a file or a region of the file to be sent over the network.
+   Accepts string path to the file, instance of `java.io.File` or instance of
+   `java.nio.file.Path`."
+  ([path]
+   (http-core/http-file path nil nil nil))
+  ([path offset length]
+   (http-core/http-file path offset length nil))
+  ([path offset length chunk-size]
+   (http-core/http-file path offset length chunk-size)))

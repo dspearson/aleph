@@ -60,15 +60,16 @@
      ProxyConnectException
      ProxyHandler
      HttpProxyHandler
+     HttpProxyHandler$HttpProxyConnectException
      Socks4ProxyHandler
      Socks5ProxyHandler]
     [io.netty.handler.logging
-     LoggingHandler
-     LogLevel]
+     LoggingHandler]
     [java.util.concurrent
      ConcurrentLinkedQueue]
     [java.util.concurrent.atomic
-     AtomicInteger]
+     AtomicInteger
+     AtomicBoolean]
     [aleph.utils
      ProxyConnectionTimeoutException]))
 
@@ -366,8 +367,19 @@
     ([_ ctx cause]
       (if-not (instance? ProxyConnectException cause)
         (.fireExceptionCaught ^ChannelHandlerContext ctx cause)
-        (do
-          (s/put! response-stream (ProxyConnectionTimeoutException. cause))
+        (let [message (.getMessage ^Throwable cause)
+              headers (when (instance? HttpProxyHandler$HttpProxyConnectException cause)
+                        (.headers ^HttpProxyHandler$HttpProxyConnectException cause))
+              response (cond
+                         (= "timeout" message)
+                         (ProxyConnectionTimeoutException. cause)
+
+                         (some? headers)
+                         (ex-info message {:headers (http/headers->map headers)})
+
+                         :else
+                         cause)]
+          (s/put! response-stream response)
           ;; client handler should take care of the rest
           (netty/close ctx))))
 
@@ -376,21 +388,6 @@
       (when (instance? ProxyConnectionEvent evt)
         (.remove (.pipeline ctx) this))
       (.fireUserEventTriggered ^ChannelHandlerContext ctx evt))))
-
-(defn coerce-log-level [level]
-  (if (instance? LogLevel level)
-    level
-    (let [netty-level (case level
-                        :trace LogLevel/TRACE
-                        :debug LogLevel/DEBUG
-                        :info LogLevel/INFO
-                        :warn LogLevel/WARN
-                        :error LogLevel/ERROR
-                        nil)]
-      (when (nil? netty-level)
-        (throw (IllegalArgumentException.
-                (str "unknown log level given: " level))))
-      netty-level)))
 
 (defn pipeline-builder
   [response-stream
@@ -416,10 +413,15 @@
     (let [handler (if raw-stream?
                     (raw-client-handler response-stream response-buffer-size)
                     (client-handler response-stream response-buffer-size))
-          logger (when (some? log-activity)
-                   (LoggingHandler.
-                    "aleph-client"
-                    ^LogLevel (coerce-log-level log-activity)))]
+          logger (cond
+                   (instance? LoggingHandler log-activity)
+                   log-activity
+
+                   (some? log-activity)
+                   (netty/activity-logger "aleph-client" log-activity)
+
+                   :else
+                   nil)]
       (doto pipeline
         (.addLast "http-client"
           (HttpClientCodec.
@@ -444,7 +446,7 @@
               ^ChannelHandler
               (pending-proxy-connection-handler response-stream)))))
       (when (some? logger)
-        (.addFirst pipeline "activity-logger" logger))
+        (.addFirst pipeline "activity-logger" ^ChannelHandler logger))
       (pipeline-transform pipeline))))
 
 (defn close-connection [f]
@@ -633,7 +635,12 @@
          in (atom nil)
          desc (atom {})
          ^ConcurrentLinkedQueue pending-pings (ConcurrentLinkedQueue.)
-         handshaker (websocket-handshaker uri sub-protocols extensions? headers max-frame-payload)]
+         handshaker (websocket-handshaker uri
+                                          sub-protocols
+                                          extensions?
+                                          headers
+                                          max-frame-payload)
+         closing? (AtomicBoolean. false)]
 
      [d
 
@@ -650,8 +657,8 @@
        ([_ ctx]
         (when (realized? d)
           ;; close only on success
-          (d/chain' d s/close!))
-        (http/resolve-pings! pending-pings false)
+          (d/chain' d s/close!)
+          (http/resolve-pings! pending-pings false))
         (.fireChannelInactive ctx))
 
        :channel-active
@@ -671,76 +678,104 @@
 
        :channel-read
        ([_ ctx msg]
-        (try
-          (let [ch (.channel ctx)]
-            (cond
+        (let [ch (.channel ctx)]
+          (cond
 
-              (not (.isHandshakeComplete handshaker))
-              (-> (netty/wrap-future (.processHandshake handshaker ch msg))
-                  (d/chain'
-                   (fn [_]
-                     (let [out (netty/sink ch false
-                                           (http/websocket-message-coerce-fn ch pending-pings)
-                                           (fn [] @desc))]
+            (not (.isHandshakeComplete handshaker))
+            (try
+              ;; Here we rely on the HttpObjectAggregator being added
+              ;; to the pipeline in advance, so there's no chance we
+              ;; could read only a partial request
+              (.finishHandshake handshaker ch msg)
+              (let [close-fn (fn [^CloseWebSocketFrame frame]
+                               (if-not (.compareAndSet closing? false true)
+                                 (do
+                                   (netty/release frame)
+                                   false)
+                                 (do
+                                   (-> (.close handshaker ch frame)
+                                       netty/wrap-future
+                                       (d/chain' (fn [_] (netty/close ctx))))
+                                   true)))
+                    coerce-fn (http/websocket-message-coerce-fn
+                               ch
+                               pending-pings
+                               close-fn)
+                    headers (http/headers->map (.headers ^HttpResponse msg))
+                    subprotocol (.actualSubprotocol handshaker)
+                    _ (swap! desc assoc
+                             :websocket-handshake-headers headers
+                             :websocket-selected-subprotocol subprotocol)
+                    out (netty/sink ch false coerce-fn (fn [] @desc))]
 
-                       (s/on-closed out (fn [] (http/resolve-pings! pending-pings false)))
+                (s/on-closed out #(http/resolve-pings! pending-pings false))
 
-                       (d/success! d
-                                   (doto
-                                       (s/splice out @in)
-                                     (reset-meta! {:aleph/channel ch})))
+                (d/success! d
+                            (doto
+                                (s/splice out @in)
+                              (reset-meta! {:aleph/channel ch})))
 
-                       (s/on-drained @in
-                                     #(when (.isOpen ch)
-                                        (d/chain'
-                                         (netty/wrap-future (.close handshaker ch (CloseWebSocketFrame.)))
-                                         (fn [_] (netty/close ctx))))))))
-                  (d/catch'
-                      (fn [ex]
-                        ;; handle handshake exception
-                        (d/error! d ex)
-                        (s/close! @in)
-                        (netty/close ctx))))
-
-              (instance? FullHttpResponse msg)
-              (let [rsp ^FullHttpResponse msg]
-                (throw
-                 (IllegalStateException.
-                  (str "unexpected HTTP response, status: "
-                       (.status rsp)
-                       ", body: '"
-                       (bs/to-string (.content rsp))
-                       "'"))))
-
-              (instance? TextWebSocketFrame msg)
-              (netty/put! ch @in (.text ^TextWebSocketFrame msg))
-
-              (instance? BinaryWebSocketFrame msg)
-              (let [frame (.content ^BinaryWebSocketFrame msg)]
-                (netty/put! ch @in
-                            (if raw-stream?
-                              (netty/acquire frame)
-                              (netty/buf->array frame))))
-
-              (instance? PongWebSocketFrame msg)
-              (http/resolve-pings! pending-pings true)
-
-              (instance? PingWebSocketFrame msg)
-              (let [frame (.content ^PingWebSocketFrame msg)]
-                (netty/write-and-flush  ch (PongWebSocketFrame. (netty/acquire frame))))
-
-              (instance? CloseWebSocketFrame msg)
-              (let [frame ^CloseWebSocketFrame msg]
-                (when (realized? d)
-                  (swap! desc assoc
-                         :websocket-close-code (.statusCode frame)
-                         :websocket-close-msg (.reasonText frame)))
+                (s/on-drained @in #(close-fn (CloseWebSocketFrame.))))
+              (catch Throwable ex
+                ;; handle handshake exception
+                (d/error! d ex)
+                (s/close! @in)
                 (netty/close ctx))
+              (finally
+                (netty/release msg)))
 
-              :else
-              (.fireChannelRead ctx msg)))
-          (finally
-            (netty/release msg)))))])))
+            (instance? FullHttpResponse msg)
+            (let [rsp ^FullHttpResponse msg
+                  content (bs/to-string (.content rsp))]
+              (netty/release msg)
+              (throw
+               (IllegalStateException.
+                (str "unexpected HTTP response, status: "
+                     (.status rsp)
+                     ", body: '"
+                     content
+                     "'"))))
+
+            (instance? TextWebSocketFrame msg)
+            (if raw-stream?
+              (let [body (.content ^TextWebSocketFrame msg)]
+                ;; pass ByteBuf body directly to lower next
+                ;; level. it's their reponsibility to release
+                (netty/put! ch @in body))
+              (let [text (.text ^TextWebSocketFrame msg)]
+                (netty/release msg)
+                (netty/put! ch @in text)))
+
+            (instance? BinaryWebSocketFrame msg)
+            (let [frame (.content ^BinaryWebSocketFrame msg)]
+              (netty/put! ch @in
+                          (if raw-stream?
+                            frame
+                            (netty/release-buf->array frame))))
+
+            (instance? PongWebSocketFrame msg)
+            (do
+              (netty/release msg)
+              (http/resolve-pings! pending-pings true))
+
+            (instance? PingWebSocketFrame msg)
+            (let [frame (.content ^PingWebSocketFrame msg)]
+              (netty/write-and-flush  ch (PongWebSocketFrame. frame)))
+
+            ;; todo(kachayev): check RFC what should we do in case
+            ;;                 we've got > 1 closing frame from the
+            ;;                 server
+            (instance? CloseWebSocketFrame msg)
+            (let [frame ^CloseWebSocketFrame msg]
+              (when (realized? d)
+                (swap! desc assoc
+                       :websocket-close-code (.statusCode frame)
+                       :websocket-close-msg (.reasonText frame)))
+              (netty/release msg)
+              (netty/close ctx))
+
+            :else
+            (.fireChannelRead ctx msg)))))])))
 
 (defn websocket-connection
   [uri
@@ -769,7 +804,14 @@
          max-frame-payload 65536
          name-resolver :default
          max-frame-size 1048576
-         compression? false}}]
+         compression? false}
+    :as options}]
+
+  (when (and (true? (:compression? options))
+             (false? (:extensions? options)))
+    (throw (IllegalArgumentException.
+            "Per-message deflate requires extensions to be allowed")))
+
   (let [uri (URI. uri)
         scheme (.getScheme uri)
         _ (assert (#{"ws" "wss"} scheme) "scheme must be one of 'ws' or 'wss'")
@@ -793,7 +835,7 @@
                       raw-stream?
                       uri
                       sub-protocols
-                      extensions?
+                      (or extensions? compression?)
                       headers
                       max-frame-payload
                       heartbeats)]
